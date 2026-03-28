@@ -4,8 +4,10 @@ import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { FileUpload } from "@/components/file-upload";
+import { ConnectWalletButton } from "@/components/connect-wallet-button";
+import { useFreighter } from "@/hooks/use-freighter";
 import { parsePaymentFile, getBatchSummary } from "@/lib/stellar";
-import type { ParsedPaymentFile } from "@/lib/stellar/types";
+import type { ParsedPaymentFile, PaymentInstruction, BatchResult, PaymentResult } from "@/lib/stellar/types";
 import {
   Send,
   Info,
@@ -30,6 +32,10 @@ export default function NewBatchPaymentPage() {
     totalAmount: string;
     assetBreakdown: Record<string, number>;
   } | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [result, setResult] = useState<BatchResult | null>(null);
+
+  const { publicKey, signTx } = useFreighter();
 
   const handleFileSelect = async (selectedFile: File, format: "json" | "csv") => {
     setFile(selectedFile);
@@ -58,6 +64,162 @@ export default function NewBatchPaymentPage() {
 
   const estimatedFees = summary ? (summary.validCount * 0.0001).toFixed(4) : "0.0000";
 
+  const handleSubmit = async () => {
+    if (!publicKey) {
+      toast.error("Please connect your Freighter wallet first.");
+      return;
+    }
+
+    if (!validationResult || summary?.validCount === 0) {
+      toast.error("No valid payments to submit.");
+      return;
+    }
+
+    try {
+      setIsSubmitting(true);
+      const validPayments = validationResult.rows
+        .filter((row) => row.valid)
+        .map((row) => row.instruction);
+
+      // Step 1: Build unsigned XDRs
+      const buildRes = await fetch("/api/batch-build", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ payments: validPayments, network: selectedNetwork, publicKey }),
+      });
+
+      if (!buildRes.ok) {
+        const data = await buildRes.json();
+        throw new Error(data.error || "Failed to build transactions");
+      }
+
+      const { xdrs, batchCount } = await buildRes.json();
+
+      // Step 2+3: Sign and submit each XDR
+      const allResults: PaymentResult[] = [];
+      let successCount = 0;
+      let failCount = 0;
+      const startTime = new Date().toISOString();
+      const paymentsPerBatch = Math.min(100, validPayments.length);
+
+      for (let i = 0; i < xdrs.length; i++) {
+        const xdr = xdrs[i];
+        const batchStart = i * paymentsPerBatch;
+        const batchEnd = Math.min(batchStart + paymentsPerBatch, validPayments.length);
+        const batchPayments = validPayments.slice(batchStart, batchEnd);
+
+        try {
+          // Sign via Freighter
+          const signedXdr = await signTx(xdr, selectedNetwork);
+
+          // Submit the signed transaction
+          const submitRes = await fetch("/api/batch-submit-signed", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ signedXdr, network: selectedNetwork }),
+          });
+
+          const submitData = await submitRes.json();
+
+          if (submitData.success) {
+            for (const payment of batchPayments) {
+              allResults.push({
+                recipient: payment.address,
+                amount: payment.amount,
+                asset: payment.asset,
+                status: "success",
+                transactionHash: submitData.hash,
+              });
+              successCount++;
+            }
+          } else {
+            for (const payment of batchPayments) {
+              allResults.push({
+                recipient: payment.address,
+                amount: payment.amount,
+                asset: payment.asset,
+                status: "failed",
+                error: submitData.error || "Submission failed",
+              });
+              failCount++;
+            }
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : "Signing failed";
+
+          // If user rejected, stop the loop
+          if (errMsg.toLowerCase().includes("user") || errMsg.toLowerCase().includes("reject") || errMsg.toLowerCase().includes("cancel")) {
+            for (const payment of batchPayments) {
+              allResults.push({
+                recipient: payment.address,
+                amount: payment.amount,
+                asset: payment.asset,
+                status: "failed",
+                error: "Signing cancelled by user",
+              });
+              failCount++;
+            }
+            // Mark remaining batches as cancelled too
+            for (let j = i + 1; j < xdrs.length; j++) {
+              const rStart = j * paymentsPerBatch;
+              const rEnd = Math.min(rStart + paymentsPerBatch, validPayments.length);
+              for (const payment of validPayments.slice(rStart, rEnd)) {
+                allResults.push({
+                  recipient: payment.address,
+                  amount: payment.amount,
+                  asset: payment.asset,
+                  status: "failed",
+                  error: "Signing cancelled by user",
+                });
+                failCount++;
+              }
+            }
+            break;
+          }
+
+          for (const payment of batchPayments) {
+            allResults.push({
+              recipient: payment.address,
+              amount: payment.amount,
+              asset: payment.asset,
+              status: "failed",
+              error: errMsg,
+            });
+            failCount++;
+          }
+        }
+      }
+
+      // Build final result
+      const totalAmount = validPayments.reduce(
+        (sum, p) => sum + parseFloat(p.amount),
+        0,
+      );
+
+      const finalResult: BatchResult = {
+        batchId: `batch-${Date.now()}`,
+        totalRecipients: validPayments.length,
+        totalAmount: totalAmount.toString(),
+        totalTransactions: xdrs.length,
+        network: selectedNetwork,
+        timestamp: startTime,
+        submittedAt: new Date().toISOString(),
+        results: allResults,
+        summary: {
+          successful: successCount,
+          failed: failCount,
+        },
+      };
+
+      setResult(finalResult);
+      toast.success(`Batch submitted: ${successCount} successful, ${failCount} failed`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Batch submission failed");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-2 text-sm">
@@ -75,6 +237,14 @@ export default function NewBatchPaymentPage() {
         <p className="text-slate-400">
           Upload a payment file and send multiple crypto transactions securely.
         </p>
+      </div>
+
+      {/* ── Wallet Connection ───────────────────────────────────── */}
+      <div className="bg-slate-900/50 border border-slate-800 rounded-lg p-4 flex items-center justify-between">
+        <div className="text-sm text-slate-400">
+          {publicKey ? "Wallet connected" : "Connect your wallet to get started"}
+        </div>
+        <ConnectWalletButton />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -324,13 +494,25 @@ export default function NewBatchPaymentPage() {
 
           <Button 
             className="w-full h-12 bg-emerald-500 hover:bg-emerald-600 text-white text-base font-semibold disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"
-            disabled={!summary || summary.validCount === 0 || summary.invalidCount > 0}
+            disabled={!summary || summary.validCount === 0 || summary.invalidCount > 0 || !publicKey || isSubmitting}
+            onClick={handleSubmit}
+            title={!publicKey ? "Connect your Freighter wallet first" : undefined}
           >
             <Send className="w-5 h-5 mr-2" />
-            {summary && summary.invalidCount > 0
-              ? "Resolve Validation Errors"
-              : "Submit Batch Payment"}
+            {isSubmitting
+              ? "Processing…"
+              : !publicKey
+                ? "Connect Wallet to Submit"
+                : summary && summary.invalidCount > 0
+                  ? "Resolve Validation Errors"
+                  : "Sign & Submit Batch"}
           </Button>
+
+          {!publicKey && (
+            <p className="text-xs text-center text-amber-400">
+              ⚠ You must connect your Freighter wallet before submitting.
+            </p>
+          )}
 
           <div className="space-y-3">
             <div className="flex items-start gap-2 text-sm">

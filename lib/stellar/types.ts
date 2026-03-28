@@ -90,3 +90,31 @@ export interface BuildBatchResult {
   network: "testnet" | "mainnet";
   publicKey: string;
 }
+
+/** Fee statistics from Horizon */
+export interface FeeStats {
+  min: string;
+  max: string;
+  mode: string;
+  p10: string;
+  p20: string;
+  p30: string;
+  p40: string;
+  p50: string;
+  p60: string;
+  p70: string;
+  p80: string;
+  p90: string;
+  p95: string;
+  p99: string;
+}
+
+/** Options for fee calculation */
+export interface FeeOptions {
+  /** Multiplier to apply to the fetched fee for safety margin (default: 1.1 = 10% buffer) */
+  safetyMultiplier?: number;
+  /** Minimum fee to use even if fetched fee is lower (default: BASE_FEE) */
+  minFee?: number;
+  /** Maximum fee to use even if fetched fee is higher (default: 1000000 = 0.1 XLM) */
+  maxFee?: number;
+}

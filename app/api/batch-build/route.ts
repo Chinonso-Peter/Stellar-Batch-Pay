@@ -10,7 +10,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
     TransactionBuilder,
-    BASE_FEE,
     Networks,
     Asset as StellarAsset,
     Operation,
@@ -18,7 +17,7 @@ import {
     Memo,
     StrKey,
 } from "stellar-sdk";
-import { validatePaymentInstructions } from "@/lib/stellar";
+import { validatePaymentInstructions, getRecommendedFee } from "@/lib/stellar";
 import { createBatches, parseAsset } from "@/lib/stellar/batcher";
 import { validatePaymentInstruction } from "@/lib/stellar/validator";
 import type { PaymentInstruction } from "@/lib/stellar/types";
@@ -86,9 +85,12 @@ export async function POST(request: NextRequest) {
         const server = new Horizon.Server(serverUrl);
 
         const sourceAccount = await server.loadAccount(publicKey);
-        const batches = createBatches(payments, MAX_OPS, { network });
+        const batches = await createBatches(payments, MAX_OPS, { network, server });
         const networkPassphrase =
             network === "testnet" ? Networks.TESTNET : Networks.PUBLIC;
+
+        // Fetch dynamic fee from Horizon
+        const dynamicFee = await getRecommendedFee(server);
 
         const xdrs: string[] = [];
 
@@ -97,7 +99,7 @@ export async function POST(request: NextRequest) {
             const memoId = `bp-${Date.now()}-${i}`;
 
             let builder = new TransactionBuilder(sourceAccount, {
-                fee: BASE_FEE,
+                fee: String(dynamicFee),
                 networkPassphrase,
             }).addMemo(Memo.text(memoId.slice(0, 28)));
 
